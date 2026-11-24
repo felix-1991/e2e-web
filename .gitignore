@@ -1,0 +1,23 @@
+.DS_Store
+
+# Python environments and build artifacts
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+*.egg-info/
+build/
+dist/
+/uv.lock
+
+# Local browser state and validation records
+.e2e/
+/LIVE_VALIDATION.md
+/VERIFIED.md
+
+# Local environment files and shareable templates
+*.env
+*.env.*
+!*.env.example
+!*.env.*.example

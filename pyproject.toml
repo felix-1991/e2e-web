@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "e2e-web-sdk"
+version = "0.1.0"
+description = "Framework-independent synchronous Web automation and agent SDK"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "playwright>=1.49,<2",
+    "jsonschema>=4.18,<5",
+    "python-dotenv>=1,<2",
+    "pydantic>=2.11,<3",
+    "pydantic-settings>=2.10,<3",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=8,<10"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+e2e_web = ["py.typed", "semantic.js"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = ["browser: requires an installed Chromium browser"]
