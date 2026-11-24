@@ -1,0 +1,4 @@
+include .env.example ALIGNMENT.md
+include scripts/live_web_validation.py
+recursive-include examples *.py *.md *.env.example
+include tests/conftest.py
