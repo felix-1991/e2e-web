@@ -34,6 +34,9 @@ class CacheConfig:
     directory: Path | str = ".e2e/cache"
     strict: bool = False
     store: CacheStore | None = None
+    # A retried attempt does not replay what the previous attempt recorded: the
+    # recording is what just failed, and replaying it repeats the same outcome.
+    attempt: int = 0
 
 
 @dataclass(frozen=True)
@@ -49,6 +52,16 @@ class AgentConfig:
     on_before_action: Callable[[dict[str, Any]], None] | None = None
     on_action: Callable[[dict[str, Any]], None] | None = None
     vision: VisionMode | None = None
+    # One browser operation gets its own budget, so a control that never becomes
+    # actionable is reported to the model instead of ending the step.
+    action_timeout: float = 20
+    # When set, the harness trims every observation to fit this model context,
+    # whatever executor is configured. Measured as UTF-8 bytes, an upper bound.
+    max_input_tokens: int | None = None
+    # A built-in Chat Completions executor keeps one conversation per step and
+    # sends screen differences after the first look. Disable for a provider or
+    # gateway that dislikes multi-message requests.
+    stateful: bool = True
 
 
 @dataclass(frozen=True)
@@ -102,6 +115,7 @@ class StepRecord:
     cache: dict[str, Any] = field(default_factory=dict)
     error: dict[str, str] | None = None
     explanation: str = ""
+    model_usage: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)

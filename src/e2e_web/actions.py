@@ -12,12 +12,15 @@ FOCUS_OPS = {"type", "press"}
 VALUE_OPS = {"fill", "type", "press", "select", "upload"}
 VISUAL_OPS = {"click_at", "hover_at", "drag_at", "type_at", "press_at", "select_at"}
 TAB_OPS = {"switch_tab", "close_tab"}
+SCROLL_DIRECTIONS = {"up", "down", "left", "right"}
 MODIFIERS = {"Alt", "Control", "ControlOrMeta", "Meta", "Shift"}
 
 
 def _is_select_option(value: Any) -> bool:
     if isinstance(value, str):
         return True
+    if isinstance(value, dict) and set(value) == {"group", "label"}:
+        return all(isinstance(part, str) for part in value.values())
     if not isinstance(value, dict) or len(value) != 1:
         return False
     key, option = next(iter(value.items()))
@@ -28,8 +31,7 @@ def _is_select_option(value: Any) -> bool:
 
 def recordable_action(action: dict[str, Any]) -> bool:
     op = action["op"]
-    return (op not in VISUAL_OPS and op not in TAB_OPS
-            and op not in {"tool", "upload", "scroll_find", "resize_viewport", "screenshot"}
+    return (op not in {"tool", "resize_viewport", "screenshot", "observe"}
             and (op not in FOCUS_OPS or "target" in action) and action.get('times', 1) == 1)
 
 
@@ -51,9 +53,21 @@ def validate_target(target: Any) -> dict[str, Any]:
         if not isinstance(target.get("observation"), str) or not target["observation"]:
             raise E2EError("MODEL_OUTPUT_INVALID", "ref requires an observation id")
     if target["by"] == "semantic":
-        allowed = {"by", "value", "name", "test_id", "frame", "frame_identity", "within"}
+        allowed = {"by", "value", "name", "test_id", "frame", "frame_identity", "within", "dynamic_test_id",
+                   "href", "input_type", "level", "position", "text", "description"}
         if not isinstance(target.get("name"), str) or not isinstance(target.get("test_id", ""), str):
             raise E2EError("MODEL_OUTPUT_INVALID", "semantic target requires name and optional test_id")
+        if "input_type" in target and (not isinstance(target["input_type"], str)
+                                       or not 0 < len(target["input_type"]) <= 128):
+            raise E2EError("MODEL_OUTPUT_INVALID", "semantic input_type must be bounded text")
+        if "level" in target and (target["value"] != "heading" or type(target["level"]) is not int
+                                  or not 1 <= target["level"] <= 2**53 - 1):
+            raise E2EError("MODEL_OUTPUT_INVALID", "semantic level requires a positive heading level")
+        if "href" in target and (target.get("value") != "link" or not isinstance(target["href"], str)
+                                 or not target["href"] or len(target["href"]) > 512):
+            raise E2EError("MODEL_OUTPUT_INVALID", "semantic href requires a link and a bounded destination")
+        if 'dynamic_test_id' in target and (target['dynamic_test_id'] is not True or not target.get('test_id')):
+            raise E2EError('MODEL_OUTPUT_INVALID', 'dynamic_test_id requires true and a test_id')
         if 'frame_identity' in target:
             identities = target['frame_identity']
             frames = target.get('frame', [])
@@ -62,6 +76,15 @@ def validate_target(target: Any) -> dict[str, Any]:
                 isinstance(item, dict) and set(item) == {'id', 'name', 'src', 'title'} and
                 all(isinstance(v, str) for v in item.values()) for item in identities):
                 raise E2EError('MODEL_OUTPUT_INVALID', 'frame_identity must describe every frame in the chain')
+        for key in ('text', 'description'):
+            if key in target and (not isinstance(target[key], str) or not 0 < len(target[key]) <= 512):
+                raise E2EError('MODEL_OUTPUT_INVALID', f'semantic {key} must be bounded nonempty text')
+        if 'position' in target:
+            position = target['position']
+            if (not isinstance(position, dict) or set(position) != {'index', 'of'}
+                    or type(position['index']) is not int or type(position['of']) is not int
+                    or not 1 <= position['of'] <= 1000 or not 0 <= position['index'] < position['of']):
+                raise E2EError('MODEL_OUTPUT_INVALID', 'semantic position must name a 0-based index inside a bounded twin count')
         if 'within' in target:
             within = target['within']
             if (not isinstance(within, dict) or set(within) - {'role', 'name', 'test_id'}
@@ -171,12 +194,29 @@ def validate_action(action: Any) -> dict[str, Any]:
         if type(action.get("tab")) is not int or not 1 <= action["tab"] <= 2**53 - 1:
             raise E2EError("MODEL_OUTPUT_INVALID", "tab must be a positive integer from the observation")
     elif op == "scroll":
-        fields |= {"x", "y"}
-        if any(type(action.get(k)) is not int or abs(action[k]) > 10000 for k in ("x", "y")):
-            raise E2EError("MODEL_OUTPUT_INVALID", "scroll requires bounded integer x/y deltas")
+        if "direction" in action:
+            fields.add("direction")
+            if action.get("direction") not in SCROLL_DIRECTIONS:
+                raise E2EError("MODEL_OUTPUT_INVALID", "scroll.direction must be up, down, left or right")
+            if "times" in action:
+                fields.add("times")
+                if type(action["times"]) is not int or not 1 <= action["times"] <= 20:
+                    raise E2EError("MODEL_OUTPUT_INVALID", "scroll.times must be an integer from 1 to 20")
+        else:
+            fields |= {"x", "y"}
+            if any(type(action.get(k)) is not int or abs(action[k]) > 10000 for k in ("x", "y")):
+                raise E2EError("MODEL_OUTPUT_INVALID", "scroll requires bounded integer x/y deltas or a direction")
         if "target" in action:
             fields.add("target")
             validate_target(action["target"])
+    elif op == "dialog":
+        fields.add("action")
+        if action.get("action") not in ("accept", "dismiss"):
+            raise E2EError("MODEL_OUTPUT_INVALID", "dialog requires action accept or dismiss")
+        if "text" in action:
+            fields.add("text")
+            if action["action"] != "accept" or not isinstance(action["text"], str) or len(action["text"]) > 1024:
+                raise E2EError("MODEL_OUTPUT_INVALID", "dialog text needs accept and at most 1024 characters")
     elif op == "wait":
         fields.add("seconds")
         if type(action.get("seconds")) not in {int, float} or not 0 < action["seconds"] <= 5:
@@ -185,7 +225,7 @@ def validate_action(action: Any) -> dict[str, Any]:
         fields |= {"name", "arguments"}
         if not isinstance(action.get("name"), str) or not isinstance(action.get("arguments"), dict):
             raise E2EError("MODEL_OUTPUT_INVALID", "tool requires name and arguments")
-    elif op not in {"back", "forward", "reload", "screenshot"}:
+    elif op not in {"back", "forward", "reload", "screenshot", "observe"}:
         raise E2EError("MODEL_OUTPUT_INVALID", "unknown action operation")
     if set(action) != fields:
         raise E2EError("MODEL_OUTPUT_INVALID", f"{op} requires exactly {sorted(fields)}")

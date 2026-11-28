@@ -73,6 +73,7 @@ def test_import_automatically_loads_sdk_configuration(tmp_path):
     subprocess.run(
         [sys.executable, "-c", """
 import os
+import sys
 from unittest.mock import Mock, patch
 from e2e_web import ChatCompletionsExecutor, DeepSeekExecutor, ObservationConfig, Web
 assert os.environ['E2E_MODEL'] == 'file-model'
@@ -93,7 +94,7 @@ with patch('playwright.sync_api.sync_playwright', return_value=Mock(start=Mock(r
         with Web.attach(page, name='explicit-limits', app_identity='test',
                         observation=ObservationConfig(max_nodes=80)) as session:
             assert session.engine.observation == ObservationConfig(max_nodes=80)
-playwright.chromium.launch.assert_called_once_with(headless=True, executable_path='/configured/chrome')
+playwright.chromium.launch.assert_called_once_with(chromium_sandbox=sys.platform != "linux", headless=True, executable_path='/configured/chrome')
 """],
         cwd=tmp_path, env=env, check=True, capture_output=True,
     )
@@ -141,16 +142,16 @@ def test_browser_defaults_and_overrides(monkeypatch, playwright_driver):
     monkeypatch.setenv("E2E_HEADLESS", " ")
     monkeypatch.delenv("E2E_CHROMIUM_EXECUTABLE", raising=False)
     with Web():
-        playwright_driver.chromium.launch.assert_called_once_with(headless=True)
+        playwright_driver.chromium.launch.assert_called_once_with(chromium_sandbox=sys.platform != "linux", headless=True)
 
     monkeypatch.setenv("E2E_HEADLESS", " OFF ")
     monkeypatch.setenv("E2E_CHROMIUM_EXECUTABLE", "/env/chrome")
     with Web():
-        playwright_driver.chromium.launch.assert_called_with(headless=False, executable_path="/env/chrome")
+        playwright_driver.chromium.launch.assert_called_with(chromium_sandbox=sys.platform != "linux", headless=False, executable_path="/env/chrome")
     with Web(headless=True, executable_path="/explicit/chrome", launch_options={"headless": False}):
-        playwright_driver.chromium.launch.assert_called_with(headless=True, executable_path="/explicit/chrome")
+        playwright_driver.chromium.launch.assert_called_with(chromium_sandbox=sys.platform != "linux", headless=True, executable_path="/explicit/chrome")
     with Web(launch_options={"executable_path": "/launch/chrome", "headless": True}):
-        playwright_driver.chromium.launch.assert_called_with(headless=True, executable_path="/launch/chrome")
+        playwright_driver.chromium.launch.assert_called_with(chromium_sandbox=sys.platform != "linux", headless=True, executable_path="/launch/chrome")
     with Web(browser_type="firefox"):
         playwright_driver.firefox.launch.assert_called_once_with(headless=False)
 
@@ -163,3 +164,38 @@ def test_invalid_browser_setting_names_the_variable(monkeypatch, playwright_driv
         assert playwright_driver.chromium.launch.call_args.kwargs["headless"] is False
     with Web(cdp_url="http://browser.test"):
         playwright_driver.chromium.connect_over_cdp.assert_called_once_with("http://browser.test")
+
+
+@pytest.mark.parametrize("fail_connection", [False, True])
+def test_provider_lease_released_once(playwright_driver, fail_connection):
+    from contextlib import contextmanager
+
+    calls = []
+
+    @contextmanager
+    def lease():
+        calls.append("acquire")
+        try:
+            yield "http://browser.test"
+        finally:
+            calls.append("release")
+
+    host = Web(provider=lease)
+    if fail_connection:
+        playwright_driver.chromium.connect_over_cdp.side_effect = RuntimeError("unavailable")
+        with pytest.raises(E2EError, match="BROWSER_CONNECTION_FAILED"):
+            with host:
+                pytest.fail("connection unexpectedly succeeded")
+    else:
+        with host:
+            assert calls == ["acquire"]
+    host.close()
+    playwright_driver.chromium.connect_over_cdp.assert_called_once_with("http://browser.test")
+    assert calls == ["acquire", "release"]
+
+def test_cdp_headers_apply_only_to_handshake(playwright_driver):
+    with Web(cdp_url="http://browser.test", cdp_headers={"Authorization": "Bearer example"}):
+        playwright_driver.chromium.connect_over_cdp.assert_called_once_with(
+            "http://browser.test", headers={"Authorization": "Bearer example"})
+    with pytest.raises(E2EError, match="cdp_headers"):
+        Web(cdp_headers={"X-Preview": "test"})

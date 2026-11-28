@@ -1,13 +1,15 @@
 """Track the tab and descendants that belong to one Playwright session."""
 
+import time
 from urllib.parse import urlsplit, urlunsplit
 from weakref import WeakSet
 
 from .errors import E2EError
+from ._utils import digest
 
 
 class Tabs:
-    def __init__(self, page, *, own_initial):
+    def __init__(self, page, *, own_initial, on_page=None):
         self.context = page.context
         self.initial = page
         self.own_initial = own_initial
@@ -15,12 +17,15 @@ class Tabs:
         self.next_id = 2
         self.entries = {1: (page, None)}
         self.recent = [1]
+        self.on_page = on_page
         self.excluded = WeakSet(candidate for candidate in self.context.pages
                                 if not own_initial and candidate is not page)
+        if on_page is not None:
+            on_page(page)
 
-    def exclude(self, page):
+    def exclude(self, pages):
         """Give a popup to its independent WebSession."""
-        self.excluded.add(page)
+        self.excluded.update(pages)
         self.refresh()
 
     def refresh(self):
@@ -28,11 +33,20 @@ class Tabs:
         for page in self.context.pages:
             if page in known or page in self.excluded:
                 continue
-            opener = known.get(page.opener())
-            if opener is not None:
-                known[page] = self.next_id
-                self.entries[self.next_id] = (page, opener)
-                self.next_id += 1
+            parent = page.opener()
+            if parent is not None and parent in self.excluded:
+                self.excluded.add(page)
+                continue
+            opener = known.get(parent)
+            if opener is None and not self.own_initial:
+                # In a borrowed context an unrelated page is the caller's, but a context
+                # this session owns has no other author: a popup with rel=noopener is the app's.
+                continue
+            known[page] = self.next_id
+            self.entries[self.next_id] = (page, opener)
+            self.next_id += 1
+            if self.on_page is not None:
+                self.on_page(page)
 
         removed = {number for number, (page, _) in self.entries.items()
                    if page.is_closed() or page in self.excluded}
@@ -58,10 +72,27 @@ class Tabs:
             self.refresh()
         return self.entries.get(self.active, (self.initial, None))[0]
 
+    def fingerprint(self):
+        """Bind each session-local tab number to its opener and full URL."""
+        self.refresh()
+        return digest([self.active, [(number, opener, page.url)
+                                     for number, (page, opener) in self.entries.items()]])
+
+    def wait_for_fingerprint(self, expected, timeout):
+        end = time.monotonic() + min(0.75, timeout)
+        while self.fingerprint() != expected:
+            remaining = end - time.monotonic()
+            if remaining <= 0:
+                return False
+            self.page.wait_for_timeout(min(25, remaining * 1000))
+        return True
+
     def summary(self):
         self.refresh()
         # Preserve the active tab and cap the metadata sent to the model.
-        numbers = sorted({self.active, *list(self.entries)[:19]} & self.entries.keys())
+        numbers = list(self.entries)[-20:]
+        if self.active in self.entries and self.active not in numbers:
+            numbers[0] = self.active
         tabs = [dict(tab=number, url=self._display_url(self.entries[number][0].url)) for number in numbers]
         return {'active_tab': self.active, 'tabs': tabs, 'tab_count': len(self.entries)}
 

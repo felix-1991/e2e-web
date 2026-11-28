@@ -85,19 +85,34 @@ def test_verified_replay_and_live_judgment(make_session):
 
 
 @pytest.mark.parametrize("starts_with_navigation", [False, True])
-def test_strict_replay_rejects_a_different_start_origin(make_session, tmp_path, starts_with_navigation):
+def test_strict_replay_rejects_a_step_that_started_on_another_site(make_session, tmp_path, starts_with_navigation):
     params = {"value": "first"}
     if starts_with_navigation:
         params = {"actions": [{"op": "navigate", "url": "https://app.example/next"}]}
     with make_session() as first:
+        # Establish the app's own origin, then record a step on another site:
+        # only a location on that site is the same screen for the recording.
+        first.observe()
+        first.engine.url = "https://third.example/form"
         first.agent.act("Apply input", params)
         first.verify(lambda: first.engine.actions)
     strict = CacheConfig(directory=tmp_path / "cache", strict=True)
     with make_session(cache=strict) as other:
-        other.engine.url = "https://other.example/form"
+        other.observe()
+        other.engine.url = "https://elsewhere.example/form"
         with pytest.raises(ReplayStale, match="starting origin"):
             other.agent.act("Apply input", params)
         assert not other.engine.actions and other.steps[-1].model_calls == 0
+
+
+def test_replay_follows_the_app_to_another_deployment(make_session):
+    with make_session() as first:
+        first.agent.act("Apply input", {"value": "first"})
+        first.agent.assert_("Input was applied")
+    with make_session() as second:
+        second.engine.url = "https://deploy.example/form"
+        result = second.agent.act("Apply input", {"value": "first"})
+        assert result.cache["mode"] == "replay" and result.model_calls == 0
 
 
 @pytest.mark.parametrize("follow_up", [False, True])
@@ -326,6 +341,59 @@ def test_agent_methods_inherit_session_vision_and_allow_an_explicit_override(mak
     assert [request.get("screenshot") for request in requests[-2:]] == [None, "aW1hZ2U="]
 
 
+def test_text_screenshot_correction_continues_after_prior_action(make_session):
+    fill = dict(op="fill", target=target(), value="chosen")
+    click = dict(op="click", target=target("button", "Apply"))
+    answers = iter([{"action": fill}, {"action": {"op": "screenshot"}}, {"action": click}, {"done": True}])
+
+    def decide(request, *, timeout):
+        assert "screenshot" not in request
+        if len(request["history"]) == 2:
+            assert request["history"][-1]["dispatched"] is False
+            assert "node ref" in request["history"][-1]["error"]["message"]
+            assert "chosen" in request["observation"]["tree"]
+        return next(answers)
+
+    with make_session(executor=FunctionExecutor(decide)) as session:
+        result = session.agent.act("Apply chosen value", vision=False, max_actions=2)
+        assert session.engine.actions == [fill, click]
+        assert (result.actions, result.model_calls) == (2, 4)
+
+
+@pytest.mark.parametrize("vision", [False, True])
+def test_act_once_corrects_screenshot_before_single_action(make_session, vision):
+    def decide(request, *, timeout):
+        assert ("screenshot" in request) == vision
+        if not request["history"]:
+            return {"action": {"op": "screenshot"}}
+        if vision:
+            assert "attached image" in request["history"][-1]["error"]["message"]
+        return {"action": dict(op="click", target=target("button", "Apply"))}
+
+    with make_session(executor=FunctionExecutor(decide)) as session:
+        if vision:
+            session.engine.screenshot = lambda **_: b"image"
+        result = session.agent.act_once("Click Apply", vision=vision)
+        assert (result.actions, result.model_calls) == (1, 2)
+
+
+@pytest.mark.parametrize(("budget", "followup", "code", "calls"), [
+    (1, None, "STEP_BUDGET_EXHAUSTED", 1),
+    (3, {"action": {"op": "screenshot"}}, "MODEL_OUTPUT_INVALID", 2),
+    (3, {"blocked": "missing target"}, "AUTOMATION_UNSUPPORTED", 2),
+])
+def test_text_screenshot_correction_limits(make_session, budget, followup, code, calls):
+    def decide(request, *, timeout):
+        return followup if request["history"] else {"action": {"op": "screenshot"}}
+
+    with make_session(executor=FunctionExecutor(decide)) as session:
+        with pytest.raises(E2EError) as err:
+            session.agent.act("Find target", vision=False, max_model_calls=budget)
+        assert err.value.code == code
+        assert session.steps[-1].model_calls == calls
+        assert session.engine.actions == []
+
+
 def test_environment_vision_respects_secret_policy(make_session, monkeypatch):
     monkeypatch.setenv("E2E_VISION", "true")
     with make_session(secrets=(Secret("password", "test-password"),)) as session:
@@ -402,3 +470,75 @@ def test_close_idempotent_and_thread_affinity(make_session):
 def test_malformed_actions_fail_before_execution(action):
     with pytest.raises(E2EError, match="MODEL_OUTPUT_INVALID"):
         validate_action(action)
+
+
+@pytest.mark.parametrize("partial", [
+    {"truncated": True}, {"frames": [{"tree": "<frame unavailable>", "selector": "iframe"}]},
+    {"nodes": [{"options_truncated": True}]},
+])
+def test_partial_view_cannot_record_or_start_strict_replay(make_session, tmp_path, partial):
+    def patch_view(session):
+        observe = session.engine.observe
+        session.engine.observe = lambda **kwargs: dict(observe(**kwargs), **partial)
+
+    with make_session() as session:
+        patch_view(session)
+        session.agent.act("Apply input", {"value": "first"})
+        session.agent.assert_("Input was applied")
+    assert not list((tmp_path / "cache").glob("*.json"))
+    record(make_session)
+    with make_session(cache=CacheConfig(directory=tmp_path / "cache", strict=True)) as session:
+        patch_view(session)
+        with pytest.raises(ReplayStale, match="incomplete"):
+            session.agent.act("Apply input", {"value": "first"})
+        assert not session.engine.actions
+
+
+def test_insufficient_call_budget_preserves_a_verified_recording(make_session):
+    record(make_session)
+    with make_session() as session:
+        with pytest.raises(E2EError, match="STEP_BUDGET_EXHAUSTED"):
+            session.agent.act("Apply input", {"value": "first"}, max_actions=1)
+        assert not session.engine.actions
+    with make_session() as session:
+        assert session.agent.act("Apply input", {"value": "first"}).model_calls == 0
+
+
+def test_failed_parameter_validation_does_not_register_a_secret(make_session):
+    with make_session() as session:
+        with pytest.raises(E2EError, match="INVALID_ARGUMENT"):
+            session.agent.act("Fill", {"secret": Secret("code", "old"), "bad": object()})
+        session.agent.act("Apply input", {"value": "first", "secret": Secret("code", "new")})
+        assert session.engine.result == "Applied first"
+
+
+def test_ordinary_parameter_objects_do_not_authorize_secret_fills(make_session):
+    def decide(request, *, timeout):
+        return {"action": dict(op="fill_secret", target=target(), secret="credential")}
+
+    with make_session(executor=FunctionExecutor(decide),
+                      secrets=(Secret("credential", "test-value"),)) as session:
+        with pytest.raises(E2EError, match="POLICY_DENIED"):
+            session.agent.act_once("Fill", {"item": {"kind": "secret", "name": "credential"}})
+        assert session.engine.actions == []
+
+
+def test_rejected_reentrant_act_preserves_the_next_recording_key(make_session):
+    record(make_session)
+    with make_session() as session:
+        def nested():
+            with pytest.raises(E2EError, match="CONCURRENT_OPERATION"):
+                session.agent.act("Apply input", {"value": "first"})
+        session.verify(nested)
+        assert session.agent.act("Apply input", {"value": "first"}).model_calls == 0
+
+
+def test_replay_on_new_deployment_rejects_a_return_to_the_former_app(make_session):
+    record(make_session)
+    with make_session() as session:
+        session.engine.url = "https://deploy.example/form"
+        session.observe()
+        session.engine.url = "https://app.example/form"
+        # This is a different site from the app established for this session.
+        session.agent.act("Apply input", {"value": "first"})
+        assert session.steps[-1].model_calls > 0

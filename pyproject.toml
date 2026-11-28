@@ -3,7 +3,7 @@ requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "e2e-web-sdk"
+name = "e2e-web"
 version = "0.1.0"
 description = "Framework-independent synchronous Web automation and agent SDK"
 readme = "README.md"

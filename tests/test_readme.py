@@ -88,6 +88,38 @@ def test_readme_quickstart_runs_without_a_model(tmp_path, monkeypatch):
     run_readme_example("运行第一个浏览器操作")
 
 
+def latest_request(messages):
+    """The newest decision payload, with stateful screen updates applied."""
+    nodes, request = {}, None
+    for message in messages:
+        if message.get("role") != "user" or not isinstance(message.get("content"), str):
+            continue
+        try:
+            payload = json.loads(message["content"])
+        except ValueError:
+            continue
+        if not isinstance(payload, dict) or "observation" not in payload:
+            continue
+        observation = payload["observation"]
+        changes = observation.get("changes")
+        if "nodes" in observation:
+            nodes = {node["id"]: node for node in observation["nodes"]}
+        elif changes is not None:
+            for node in changes.get("added", []):
+                nodes[node["id"]] = node
+            for item in changes.get("changed", []):
+                nodes.setdefault(item["id"], {"id": item["id"]}).update(item.get("now") or {})
+                for key in item.get("unset", []):
+                    nodes[item["id"]].pop(key, None)
+            for node_id in changes.get("removed", []):
+                nodes.pop(node_id, None)
+        prior = request or {}
+        history = prior.get("history", []) + payload.get("history", [])
+        request = {**prior, **payload, "history": history,
+                   "observation": dict(observation, nodes=list(nodes.values()))}
+    return request
+
+
 @pytest.fixture
 def search_service():
     calls = Counter()
@@ -107,7 +139,7 @@ def search_service():
                 self.send_error(404)
                 return
             body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
-            request = json.loads(body["messages"][-1]["content"])
+            request = latest_request(body["messages"])
             kind = request["kind"]
             calls[kind] += 1
             nodes = request["observation"]["nodes"]

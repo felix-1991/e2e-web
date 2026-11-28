@@ -236,6 +236,14 @@ def test_host_manages_nested_popup_sessions_with_one_context_manager(server):
         child = popup.open_popup("Open the next tab", params, name="detail")
         child_page = child.page
         child.expect(child_page.get_by_role("heading")).to_have_text("Detail")
+        with popup_page.expect_popup() as grandchild:
+            popup_page.evaluate("window.open('about:blank')")
+        assert session.observe()["tab_count"] == 1
+        assert popup.observe()["tab_count"] == 2
+        assert child.observe()["tab_count"] == 1
+        popup.close()
+        assert grandchild.value.is_closed()
+        assert not opener.is_closed()
         assert calls["act"] == 2
 
     assert all(page.is_closed() for page in (opener, popup_page, child_page))
